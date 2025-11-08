@@ -23,6 +23,10 @@ async function asPdf({
   const pageContent = [];
   let docs = await pdfLoader.load();
 
+  // Character threshold per page to determine if OCR is needed
+  // Pages with fewer characters than this are likely scanned/image-based
+  const OCR_THRESHOLD = options?.ocr?.threshold || 50;
+
   if (docs.length === 0) {
     console.log(
       `[asPDF] No text content found for ${filename}. Will attempt OCR parse.`
@@ -30,6 +34,62 @@ async function asPdf({
     docs = await new OCRLoader({
       targetLanguages: options?.ocr?.langList,
     }).ocrPDF(fullFilePath);
+  } else {
+    // Check for pages with insufficient text content (potential scanned pages in mixed PDFs)
+    const lowContentPages = [];
+    const pageMap = new Map();
+
+    for (const doc of docs) {
+      const pageNum = doc.metadata?.loc?.pageNumber;
+      if (pageNum) {
+        pageMap.set(pageNum, doc);
+        const textLength = (doc.pageContent || "").trim().length;
+        if (textLength < OCR_THRESHOLD) {
+          lowContentPages.push(pageNum);
+        }
+      }
+    }
+
+    // If we have pages with low content, OCR those specific pages
+    if (lowContentPages.length > 0) {
+      console.log(
+        `[asPDF] Found ${lowContentPages.length} page(s) with minimal text (< ${OCR_THRESHOLD} chars). Attempting OCR on pages: ${lowContentPages.join(", ")}`
+      );
+
+      try {
+        // OCR the entire document to get all pages
+        const ocrDocs = await new OCRLoader({
+          targetLanguages: options?.ocr?.langList,
+        }).ocrPDF(fullFilePath);
+
+        // Replace low-content pages with their OCR results
+        for (const ocrDoc of ocrDocs) {
+          const pageNum = ocrDoc.metadata?.loc?.pageNumber;
+          if (pageNum && lowContentPages.includes(pageNum)) {
+            const ocrTextLength = (ocrDoc.pageContent || "").trim().length;
+            const originalTextLength = (pageMap.get(pageNum)?.pageContent || "").trim().length;
+
+            // Only replace if OCR found more content
+            if (ocrTextLength > originalTextLength) {
+              console.log(
+                `-- Replacing pg ${pageNum} content with OCR result (${originalTextLength} -> ${ocrTextLength} chars) --`
+              );
+              pageMap.set(pageNum, ocrDoc);
+            }
+          }
+        }
+
+        // Rebuild docs array with OCR-enhanced pages
+        docs = Array.from(pageMap.values()).sort(
+          (a, b) => a.metadata.loc.pageNumber - b.metadata.loc.pageNumber
+        );
+      } catch (error) {
+        console.error(
+          `[asPDF] OCR fallback failed for low-content pages: ${error.message}`
+        );
+        // Continue with original docs if OCR fails
+      }
+    }
   }
 
   for (const doc of docs) {
